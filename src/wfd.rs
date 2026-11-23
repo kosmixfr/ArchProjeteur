@@ -8,6 +8,7 @@
 
 use crate::cast::{self, Session};
 use crate::hypr;
+use crate::settings::{Media, MediaKind, Settings};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -241,7 +242,7 @@ struct Video {
 }
 
 /// Choix du format vidéo parmi ceux de l'écran (champ CEA de wfd_video_formats).
-fn choose_video(sink: Option<&str>) -> Video {
+fn choose_video(sink: Option<&str>, allow_1080p: bool) -> Video {
     let mut cea = 0x01u32;
     let mut level = 0x01u32;
     if let Some(v) = sink.filter(|v| *v != "none") {
@@ -250,7 +251,7 @@ fn choose_video(sink: Option<&str>) -> Video {
         level = f.get(3).and_then(|x| u32::from_str_radix(x.trim_end_matches(','), 16).ok()).unwrap_or(1);
         cea = f.get(4).and_then(|x| u32::from_str_radix(x, 16).ok()).unwrap_or(1);
     }
-    let (w, h, bit, lvl, rate) = if cea & 0x80 != 0 && level >= 0x04 {
+    let (w, h, bit, lvl, rate) = if allow_1080p && cea & 0x80 != 0 && level >= 0x04 {
         (1920, 1080, 0x80, 0x04, 8000) // 1080p30, niveau 4
     } else if cea & 0x20 != 0 {
         (1280, 720, 0x20, 0x01, 5000) // 720p30, niveau 3.1
@@ -273,23 +274,39 @@ fn gst_has(element: &str) -> bool {
     Command::new("gst-inspect-1.0").args(["--exists", element]).status().is_ok_and(|s| s.success())
 }
 
-fn spawn_gst(cap: Option<&Capture>, v: &Video, audio: bool, local_ip: &str, peer_ip: &str, port: u16) -> Result<Child, String> {
+/// Ce qu'on envoie à l'écran.
+enum Source<'a> {
+    Screen(&'a Capture),
+    File(&'a Media),
+    Test,
+}
+
+fn spawn_gst(src: &Source, v: &Video, audio: bool, local_ip: &str, peer_ip: &str, port: u16) -> Result<Child, String> {
     let level = if v.height >= 1080 { "4" } else { "3.1" };
+    // Un fichier vidéo n'est pas « live » : udpsink doit cadencer au temps réel.
+    let sync = matches!(src, Source::File(m) if m.kind == MediaKind::Video);
+    let video_src = match src {
+        Source::Screen(c) => format!("pipewiresrc fd=3 path={} do-timestamp=true keepalive-time=100 always-copy=true", c.node),
+        Source::File(m) if m.kind == MediaKind::Image => {
+            "filesrc @LOCATION@ ! decodebin ! videoconvert ! imagefreeze is-live=true".to_string()
+        }
+        Source::File(_) => "filesrc @LOCATION@ ! decodebin name=dec dec. ! queue".to_string(),
+        Source::Test => "videotestsrc is-live=true pattern=ball".to_string(),
+    };
     let mut desc = format!(
-        "{src} ! \
+        "{video_src} ! \
          videoconvert ! videoscale add-borders=true ! videorate ! \
          video/x-raw,format=I420,width={w},height={h},framerate=30/1,pixel-aspect-ratio=1/1 ! \
-         queue max-size-buffers=2 leaky=downstream ! \
+         {vqueue} ! \
          x264enc tune=zerolatency speed-preset=ultrafast bitrate={br} vbv-buf-capacity=300 key-int-max=30 bframes=0 cabac=false byte-stream=true ! \
          video/x-h264,profile=constrained-baseline,level=(string){level},stream-format=byte-stream ! \
          h264parse config-interval=-1 ! queue ! mux.sink_4113 \
          mpegtsmux name=mux alignment=7 pat-interval=9000 pmt-interval=9000 ! \
          rtpmp2tpay pt=33 mtu=1400 ! \
-         udpsink host={peer} port={port} bind-address={local} bind-port={sport} sync=false async=false",
-        src = match cap {
-            Some(c) => format!("pipewiresrc fd=3 path={} do-timestamp=true keepalive-time=100 always-copy=true", c.node),
-            None => "videotestsrc is-live=true pattern=ball".to_string(), // mode test
-        },
+         udpsink host={peer} port={port} bind-address={local} bind-port={sport} sync={sync} async=false",
+        // Source en direct : on jette les images en retard (latence minimale).
+        // Fichier : lu plus vite que le temps réel, il ne faut rien jeter.
+        vqueue = if sync { "queue" } else { "queue max-size-buffers=2 leaky=downstream" },
         w = v.width,
         h = v.height,
         br = v.bitrate,
@@ -298,25 +315,44 @@ fn spawn_gst(cap: Option<&Capture>, v: &Video, audio: bool, local_ip: &str, peer
         sport = RTP_SERVER_PORT,
     );
     if audio {
-        desc += " pulsesrc device=@DEFAULT_MONITOR@ do-timestamp=true ! audioconvert ! audioresample ! \
-                 audio/x-raw,rate=48000,channels=2 ! fdkaacenc bitrate=128000 ! aacparse ! \
-                 audio/mpeg,mpegversion=4,stream-format=adts ! queue ! mux.sink_4352";
+        let audio_src = match src {
+            Source::File(_) => "dec. ! queue",
+            _ => "pulsesrc device=@DEFAULT_MONITOR@ do-timestamp=true",
+        };
+        desc += &format!(
+            " {audio_src} ! audioconvert ! audioresample ! \
+             audio/x-raw,rate=48000,channels=2 ! fdkaacenc bitrate=128000 ! aacparse ! \
+             audio/mpeg,mpegversion=4,stream-format=adts ! queue ! mux.sink_4352"
+        );
     }
-    eprintln!("gst-launch-1.0 {desc}");
+
+    // Découpage en arguments ; le chemin du fichier reste un seul argument
+    // (gst-launch recolle les arguments puis interprète les guillemets).
+    let args: Vec<String> = desc
+        .split_whitespace()
+        .map(|t| match (t, src) {
+            ("@LOCATION@", Source::File(m)) => {
+                let p = m.path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+                format!("location=\"{p}\"")
+            }
+            _ => t.to_string(),
+        })
+        .collect();
+    eprintln!("gst-launch-1.0 {}", args.join(" "));
 
     let mut cmd = Command::new("gst-launch-1.0");
-    cmd.arg("-q").args(desc.split_whitespace()).stdin(Stdio::null());
-    if let Some(c) = cap {
+    cmd.arg("-q").args(&args).stdin(Stdio::null());
+    if let Source::Screen(c) = src {
         let raw = c.fd.as_raw_fd();
         unsafe {
-        use std::os::unix::process::CommandExt;
-        cmd.pre_exec(move || {
-            // fd PipeWire du portail → fd 3 dans gst-launch (dup2 retire CLOEXEC).
-            if libc::dup2(raw, 3) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(move || {
+                // fd PipeWire du portail → fd 3 dans gst-launch (dup2 retire CLOEXEC).
+                if libc::dup2(raw, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
     }
     cmd.spawn().map_err(|e| format!("gst-launch-1.0 : {e}"))
@@ -357,15 +393,26 @@ pub fn run_session(mac: &str, name: &str) -> Result<(), String> {
     signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone()).ok();
     signal_hook::flag::register(signal_hook::consts::SIGINT, stop.clone()).ok();
 
+    let settings = Settings::load();
+    let media = settings.active_media();
     let mut st = Session::new(mac, name);
-    st.set("capture", "Choisis l'écran à partager");
+    match &media {
+        Some(m) => st.set("connecting", &format!("Fichier : {}", m.file_name())),
+        None => st.set("capture", "Choisis l'écran à partager"),
+    }
 
     // Mode test (développement) : ARCHPROJ_TEST_PEER="ip_locale,ip_ecran",
     // mire GStreamer au lieu du portail et pas de Wi-Fi Direct.
     let test = std::env::var("ARCHPROJ_TEST_PEER").ok();
 
     // 1. Capture
-    let cap = if test.is_some() { None } else { Some(capture()?) };
+    let cap = if test.is_some() || media.is_some() { None } else { Some(capture()?) };
+    let source = match (&cap, &media) {
+        (Some(c), _) => Source::Screen(c),
+        (None, Some(m)) => Source::File(m),
+        (None, None) => Source::Test,
+    };
+    let media_audio = media.as_ref().map(|m| m.has_audio());
 
     // 2. Wi-Fi Direct
     st.set("connecting", "Connexion Wi-Fi Direct…");
@@ -420,8 +467,9 @@ pub fn run_session(mac: &str, name: &str) -> Result<(), String> {
         if let Some(p) = caps.param("wfd_client_rtp_ports") {
             w.sink_rtp_port = p.split_whitespace().nth(1).and_then(|x| x.parse().ok()).unwrap_or(1028);
         }
-        let video = choose_video(caps.param("wfd_video_formats"));
-        let audio = want_audio(caps.param("wfd_audio_codecs"));
+        let video = choose_video(caps.param("wfd_video_formats"), settings.allow_1080p);
+        // Son : réglage utilisateur, et pour un fichier seulement s'il a une piste audio.
+        let audio = want_audio(caps.param("wfd_audio_codecs")) && settings.audio && media_audio.unwrap_or(true);
 
         let mut m4 = format!("wfd_video_formats: {}\r\n", video.format);
         if audio {
@@ -446,8 +494,9 @@ pub fn run_session(mac: &str, name: &str) -> Result<(), String> {
         }
 
         // 4. Flux
-        let mut gst = spawn_gst(cap.as_ref(), &video, audio, &local_ip, &peer_ip, w.sink_rtp_port)?;
-        st.set("streaming", &format!("{}×{}{}", video.width, video.height, if audio { " + son" } else { "" }));
+        let mut gst = spawn_gst(&source, &video, audio, &local_ip, &peer_ip, w.sink_rtp_port)?;
+        let what = media.as_ref().map(|m| format!("{} · ", m.file_name())).unwrap_or_default();
+        st.set("streaming", &format!("{what}{}×{}{}", video.width, video.height, if audio { " + son" } else { "" }));
         hypr::notify(&format!("Diffusion vers {name}"), true);
 
         // 5. Keep-alive jusqu'à l'arrêt
@@ -490,6 +539,11 @@ pub fn run_session(mac: &str, name: &str) -> Result<(), String> {
                 break Err("l'écran ne répond plus".into());
             }
             if let Ok(Some(status)) = gst.try_wait() {
+                // Fichier terminé : on le relance en boucle sans couper la session.
+                if status.success() && media.as_ref().is_some_and(|m| m.looping) {
+                    gst = spawn_gst(&source, &video, audio, &local_ip, &peer_ip, w.sink_rtp_port)?;
+                    continue;
+                }
                 break Err(format!("GStreamer s'est arrêté ({status})"));
             }
         };

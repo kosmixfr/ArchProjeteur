@@ -24,6 +24,13 @@
 4. Accepte sur l'écran de la salle s'il le demande. Une notification confirme « Diffusion vers … ».
 5. Pour arrêter : Super+K puis Entrée sur l'écran « Connecté », ou `archprojeteur cast-stop`.
 
+### Paramètres
+
+`archprojeteur settings` (ou clic sur l'onglet) : 1080p autorisé ou non, son du PC, état de l'assistant Wi-Fi Direct.
+Les réglages sont dans `~/.config/archprojeteur/settings.json`.
+
+Section cachée : clique 5 fois sur « ArchProjeteur v… » en bas de l'onglet Paramètres. Le **mode troll** diffuse une image (figée) ou une vidéo (en boucle, avec son) au lieu de ton écran : glisse le fichier sur la fenêtre, colle son chemin ou choisis-le dans « Fichiers récents ». Quand il est actif, l'onglet Caster l'indique. « Masquer ce mode » le désactive et le recache.
+
 En cas de souci, le journal détaillé est dans `$XDG_RUNTIME_DIR/archprojeteur-cast.log`.
 
 En ligne de commande :

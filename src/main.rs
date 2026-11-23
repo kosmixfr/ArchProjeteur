@@ -13,6 +13,7 @@
 mod cast;
 mod hypr;
 mod p2p_helper;
+mod settings;
 mod wfd;
 
 use cast::{Session, WirelessDisplay};
@@ -31,6 +32,7 @@ const APP_ID: &str = "archprojeteur";
 enum Tab {
     Project,
     Cast,
+    Settings,
 }
 
 impl Tab {
@@ -38,6 +40,7 @@ impl Tab {
         match self {
             Tab::Project => "next:project",
             Tab::Cast => "next:cast",
+            Tab::Settings => "next:settings",
         }
     }
 }
@@ -75,6 +78,7 @@ fn main() {
         }
         "" | "gui" => run_gui(Tab::Project),
         "cast" => run_gui(Tab::Cast),
+        "settings" => run_gui(Tab::Settings),
         "cast-list" => cast_list(),
         "cast-stop" => match cast::stop() {
             None => println!("Aucune diffusion en cours"),
@@ -303,6 +307,9 @@ struct App<'a> {
     frames: u32,
     session: Option<Session>,
     helper_ok: Option<bool>,
+    settings: settings::Settings,
+    version_clicks: u32,
+    recent: Option<Vec<PathBuf>>,
 }
 
 impl<'a> App<'a> {
@@ -315,7 +322,7 @@ impl<'a> App<'a> {
     ) -> Self {
         let current = screens.current_mode();
         let sel_mode = Mode::ALL.iter().position(|m| *m == current).unwrap_or(0);
-        Self { tab, screens, current, sel_mode, sel_cast: 0, rx, model, action, frames: 0, session: None, helper_ok: None }
+        Self { tab, screens, current, sel_mode, sel_cast: 0, rx, model, action, frames: 0, session: None, helper_ok: None, settings: settings::Settings::load(), version_clicks: 0, recent: None }
     }
 
     fn mode_enabled(&self, mode: Mode) -> bool {
@@ -336,7 +343,7 @@ impl<'a> App<'a> {
             Tab::Cast if n_cast > 0 => {
                 self.sel_cast = (self.sel_cast as i32 + delta).rem_euclid(n_cast as i32) as usize;
             }
-            Tab::Cast => {}
+            Tab::Cast | Tab::Settings => {}
         }
     }
 
@@ -396,7 +403,11 @@ impl eframe::App for App<'_> {
 
         // Appuis venant d'une 2ᵉ invocation (raccourci pressé de nouveau).
         while let Ok(msg) = self.rx.try_recv() {
-            let wanted = if msg == "next:cast" { Tab::Cast } else { Tab::Project };
+            let wanted = match msg.as_str() {
+                "next:cast" => Tab::Cast,
+                "next:settings" => Tab::Settings,
+                _ => Tab::Project,
+            };
             if wanted == self.tab {
                 self.step(1, n_cast);
             } else {
@@ -409,8 +420,12 @@ impl eframe::App for App<'_> {
         let mut switch_tab = false;
         let mut close = false;
         let mut delta = 0;
+        let typing = self.tab == Tab::Settings; // champ texte : pas de raccourcis
         ctx.input(|i| {
             close = i.key_pressed(Key::Escape);
+            if typing {
+                return;
+            }
             switch_tab = i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::ArrowRight);
             if i.key_pressed(Key::ArrowDown)
                 || (i.key_pressed(Key::Tab) && !i.modifiers.shift)
@@ -437,6 +452,7 @@ impl eframe::App for App<'_> {
         }
         if switch_tab {
             self.tab = if self.tab == Tab::Project { Tab::Cast } else { Tab::Project };
+            // (l'onglet Paramètres ne s'atteint qu'à la souris)
         }
         if delta != 0 {
             self.step(delta, n_cast);
@@ -455,6 +471,7 @@ impl eframe::App for App<'_> {
                         self.choose_display(ctx, d);
                     }
                 }
+                Tab::Settings => {}
             }
         }
 
@@ -469,10 +486,10 @@ impl eframe::App for App<'_> {
             .show(root, |ui| {
                 // Onglets
                 ui.horizontal(|ui| {
-                    for (t, label) in [(Tab::Project, "Projeter"), (Tab::Cast, "Caster")] {
+                    for (t, label) in [(Tab::Project, "Projeter"), (Tab::Cast, "Caster"), (Tab::Settings, "Paramètres")] {
                         let active = self.tab == t;
                         let txt = egui::RichText::new(label)
-                            .font(FontId::proportional(if active { 22.0 } else { 18.0 }))
+                            .font(FontId::proportional(if active { 21.0 } else { 17.0 }))
                             .color(if active { TEXT } else { MUTED });
                         let r = ui.add(egui::Label::new(txt).sense(Sense::click()));
                         if active {
@@ -485,7 +502,7 @@ impl eframe::App for App<'_> {
                         if r.clicked() {
                             self.tab = t;
                         }
-                        ui.add_space(14.0);
+                        ui.add_space(10.0);
                     }
                 });
                 ui.add_space(16.0);
@@ -493,6 +510,7 @@ impl eframe::App for App<'_> {
                 match self.tab {
                     Tab::Project => self.ui_project(ui, ctx),
                     Tab::Cast => self.ui_cast(ui, ctx, &displays, cast_error),
+                    Tab::Settings => self.ui_settings(ui, ctx),
                 }
             });
 
@@ -563,6 +581,13 @@ impl App<'_> {
             }
             ui.label(egui::RichText::new(status).color(MUTED).font(FontId::proportional(13.0)));
         });
+        if let Some(m) = self.settings.active_media() {
+            ui.label(
+                egui::RichText::new(format!("Mode troll : « {} » au lieu de l'écran", m.file_name()))
+                    .color(ACCENT)
+                    .font(FontId::proportional(12.0)),
+            );
+        }
         ui.add_space(10.0);
 
         let list_h = ui.available_height() - 28.0;
@@ -593,6 +618,126 @@ impl App<'_> {
             }
         });
         footer(ui, "Entrée : connecter / déconnecter   ·   Gauche/Droite : onglet · Échap");
+    }
+
+    fn ui_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        use settings::{Media, MediaKind};
+        let mut changed = false;
+        let section = |ui: &mut egui::Ui, t: &str| {
+            ui.label(egui::RichText::new(t).color(TEXT).strong().font(FontId::proportional(14.0)));
+        };
+
+        // Fichier glissé sur la fenêtre → mode troll (si débloqué).
+        if self.settings.troll_unlocked {
+            if let Some(p) = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty())) {
+                self.settings.media_path = p.to_string_lossy().to_string();
+                self.settings.troll_enabled = true;
+                changed = true;
+            }
+        }
+
+        let body_h = ui.available_height() - 24.0;
+        egui::ScrollArea::vertical().max_height(body_h).auto_shrink([false, false]).show(ui, |ui| {
+            section(ui, "Diffusion sans fil");
+            changed |= ui.checkbox(&mut self.settings.allow_1080p, "Autoriser le 1080p (sinon 720p max)").changed();
+            changed |= ui.checkbox(&mut self.settings.audio, "Envoyer le son du PC").changed();
+            ui.add_space(10.0);
+            section(ui, "Raccourcis");
+            ui.label(egui::RichText::new("Super+K : Caster   ·   Super+Shift+K : Projeter").color(MUTED).font(FontId::proportional(12.0)));
+            ui.add_space(10.0);
+            section(ui, "Assistant Wi-Fi Direct");
+            let helper = match self.helper_ok {
+                Some(true) => ("Installé", OK),
+                Some(false) => ("Non installé : sudo ./install-helper.sh", ERR),
+                None => ("Vérification à l'ouverture de Caster", MUTED),
+            };
+            ui.label(egui::RichText::new(helper.0).color(helper.1).font(FontId::proportional(12.0)));
+
+            if self.settings.troll_unlocked {
+                ui.add_space(12.0);
+                egui::Frame::new()
+                    .fill(TILE)
+                    .stroke(Stroke::new(1.5, ACCENT))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(egui::RichText::new("Mode troll").color(ACCENT).strong().font(FontId::proportional(15.0)));
+                        changed |= ui
+                            .checkbox(&mut self.settings.troll_enabled, "Diffuser un fichier au lieu de l'écran")
+                            .changed();
+                        ui.label(egui::RichText::new("Image ou vidéo (glisse-la sur cette fenêtre) :").color(MUTED).font(FontId::proportional(12.0)));
+                        changed |= ui
+                            .add(egui::TextEdit::singleline(&mut self.settings.media_path).hint_text("/chemin/vers/fichier.mp4").desired_width(f32::INFINITY))
+                            .changed();
+
+                        let recent = self.recent.get_or_insert_with(|| settings::recent_media(25)).clone();
+                        egui::ComboBox::from_id_salt("recent-media")
+                            .selected_text("Fichiers récents…")
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                if recent.is_empty() {
+                                    ui.label("Rien dans Images / Vidéos / Téléchargements");
+                                }
+                                for p in &recent {
+                                    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                                    if ui.selectable_label(false, name).clicked() {
+                                        self.settings.media_path = p.to_string_lossy().to_string();
+                                        self.settings.troll_enabled = true;
+                                        changed = true;
+                                    }
+                                }
+                            });
+
+                        let (txt, col) = if self.settings.media_path.trim().is_empty() {
+                            ("Aucun fichier choisi".to_string(), MUTED)
+                        } else {
+                            match Media::from_path(&self.settings.media_path, self.settings.media_loop) {
+                                Some(m) if m.kind == MediaKind::Image => (format!("Image : {}", m.file_name()), OK),
+                                Some(m) => (format!("Vidéo : {}", m.file_name()), OK),
+                                None => ("Fichier introuvable ou format non géré".to_string(), ERR),
+                            }
+                        };
+                        ui.label(egui::RichText::new(txt).color(col).font(FontId::proportional(12.0)));
+                        changed |= ui.checkbox(&mut self.settings.media_loop, "Vidéo en boucle").changed();
+                        ui.add_space(4.0);
+                        if ui.small_button("Masquer ce mode").clicked() {
+                            self.settings.troll_unlocked = false;
+                            self.settings.troll_enabled = false;
+                            self.version_clicks = 0;
+                            changed = true;
+                        }
+                    });
+            }
+        });
+
+        // Version : 5 clics débloquent le mode caché.
+        ui.horizontal(|ui| {
+            let r = ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("ArchProjeteur v{}", env!("CARGO_PKG_VERSION")))
+                        .color(MUTED)
+                        .font(FontId::proportional(11.5)),
+                )
+                .sense(Sense::click()),
+            );
+            if r.clicked() && !self.settings.troll_unlocked {
+                self.version_clicks += 1;
+                if self.version_clicks >= 5 {
+                    self.settings.troll_unlocked = true;
+                    changed = true;
+                }
+            }
+            if !self.settings.troll_unlocked && (2..5).contains(&self.version_clicks) {
+                ui.label(egui::RichText::new(format!("encore {}…", 5 - self.version_clicks)).color(MUTED).font(FontId::proportional(11.5)));
+            } else if self.settings.troll_unlocked && self.version_clicks >= 5 {
+                ui.label(egui::RichText::new("mode secret débloqué").color(ACCENT).font(FontId::proportional(11.5)));
+            }
+        });
+
+        if changed {
+            self.settings.save();
+        }
     }
 }
 
